@@ -1,8 +1,13 @@
-Dependencies:
-* dpkt library (http://code.google.com/p/dpkt/)
+= Usage =
+replayproxy _filename.pcap_
 
-Usage:
-replayproxy FILE.pcap
+= Functionality =
+ReplayProxy
+	* parses HTTP streams from .pcap files
+	* opens a TCP socket on port 3128 and listens as a HTTP proxy using the extracted HTTP responses as a cache while refusing all requests for unknown URLs
 
-Tips/Tricks:
-* to capture .pcap files you can e.g. use tcpdump integrated in most linux distributions or Wireshark
+= Dependencies =
+	* dpkt library (http://code.google.com/p/dpkt/)
+
+= Tips/Tricks =
+	* to capture .pcap files you can e.g. use tcpdump integrated in most linux distributions or Wireshark
