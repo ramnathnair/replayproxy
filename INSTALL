@@ -1,0 +1,8 @@
+Dependencies:
+* dpkt library (http://code.google.com/p/dpkt/)
+
+Usage:
+replayproxy FILE.pcap
+
+Tips/Tricks:
+* to capture .pcap files you can e.g. use tcpdump integrated in most linux distributions or Wireshark
