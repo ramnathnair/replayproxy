@@ -39,6 +39,7 @@
 #
 ###################################################################################################
 
+import argparse
 import sys
 import socket
 import re
@@ -48,8 +49,12 @@ import gzip
 import StringIO
 
 def parsepcap(filename):
-	f = open(filename, 'rb')
-	pcap = dpkt.pcap.Reader(f)
+	try:
+		f = open(filename, 'rb')
+		pcap = dpkt.pcap.Reader(f)
+	except:
+		print "Error: HTTPParser -> Error opening file %s" % filename
+		sys.exit(1)
 
 	print "*** HTTPParser -> Loaded %s" % filename
 	
@@ -131,14 +136,13 @@ def sendResponse(resp,conn):
 	resp.headers['content-length'] = len(resp.body)
 	conn.send(resp.pack())
 
-def replayproxy(files):
+def replayproxy(files,port):
 	host = ''
-	port = 3128
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	s.bind((host,port))
 	s.listen(1)
 
-	print "*** ReplayProxy: listening"
+	print "*** ReplayProxy: listening on port %s" % port
 
 	while 1:
 		conn, addr = s.accept()
@@ -162,11 +166,17 @@ def replayproxy(files):
 	s.close()
 
 ### Main
-if len(sys.argv) <= 1:
-	print "Usage: %s filename" % sys.argv[0]
-	sys.exit(0)
+argparser = argparse.ArgumentParser()
+argparser.add_argument('-p', help='Port to listen on (DEFAULT: 3128)')
+argparser.add_argument('filename', help='Path to the .pcap file to parse')
+args = argparser.parse_args()
+if args.p == None:
+	args.p = 3128
+else:
+	try:
+		args.p = int(args.p)
+	except:
+		args.p = 3128
 
-files = parsepcap(sys.argv[1])
-#for k,v in files.iteritems():
-#	print k
-replayproxy(files)
+files = parsepcap(args.filename)
+replayproxy(files, args.p)
