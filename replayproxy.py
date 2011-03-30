@@ -42,6 +42,7 @@
 import argparse
 import sys
 import socket
+import SocketServer
 import re
 import dpkt
 
@@ -121,8 +122,23 @@ def parsepcap(filename):
 				ip = socket.inet_ntoa(k[1])
 				key = (host, uri, ip)
 				files[host+uri] = (requests[k][i],v2)
+				#print "HTTPParser extracted -> %s" % host+uri
 	print "*** HTTPParser: # Files extracted -> %d" % len(files)
 	return files
+
+def recvRequest(sock):
+	total_data = data = sock.recv(16384)
+	while 1:
+		try:
+			http_req = dpkt.http.Request(total_data)	
+			return http_req
+		except dpkt.NeedData:
+			data = sock.recv(16384)
+			total_data += data
+			pass
+		except:
+			"Error while processing HTTP Request!"
+			return None
 
 def sendResponse(resp,conn):
 	resp.version = '1.0'
@@ -136,34 +152,25 @@ def sendResponse(resp,conn):
 	resp.headers['content-length'] = len(resp.body)
 	conn.send(resp.pack())
 
-def replayproxy(files,port):
-	host = ''
-	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	s.bind((host,port))
-	s.listen(1)
+class myRequestHandler(SocketServer.BaseRequestHandler):
 
-	print "*** ReplayProxy: listening on port %s" % port
-
-	while 1:
-		conn, addr = s.accept()
-		data = conn.recv(16384)
-		if data:
-			try:
-				http = dpkt.http.Request(data)
-				url = re.sub(r"^http:\/\/","",http.uri)
-				if url in files:
-					resp = files[url][1]
-					print "Info: ReplayProxy -> Sending %s" % url
-					sendResponse(resp,conn)
-				else:
-					conn.send('')
-					print "Warn: URL not in cache -> %s" % url
-			except dpkt.UnpackError:
-				print "Error: ReplayProxy -> Parsing HTTP request"
-			#except:
-			#	print "Error: ReplayProxy -> Unexpected error"
-		conn.close()
-	s.close()
+	def handle(self):
+	# handles a request of a client
+	# callback for SocketServer
+		sock_client = self.request
+		http_req = recvRequest(sock_client)
+		if http_req:
+			print "Request for URL %s" % http_req.uri
+			url = re.sub(r"^http:\/\/","",http_req.uri)
+			if url in files:
+				resp = files[url][1]
+				print "Info: ReplayProxy -> Sending %s" % url
+				sendResponse(resp,sock_client)
+				print "Page served %s " % url
+			else:
+				sock_client.send('')
+				print "Warn: URL not in cache -> %s" % url
+		sock_client.close()
 
 ### Main
 argparser = argparse.ArgumentParser()
@@ -177,6 +184,8 @@ else:
 		args.p = int(args.p)
 	except:
 		args.p = 3128
+HOST, PORT = "localhost", args.p
 
 files = parsepcap(args.filename)
-replayproxy(files, args.p)
+server = SocketServer.TCPServer( (HOST,PORT), myRequestHandler)
+server.serve_forever()
