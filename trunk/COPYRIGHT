@@ -25,4 +25,5 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Author:	Armin Buescher (armin.buescher@googlemail.com)
+Contribs: Marco Cova (marco@lastline.com)
 Thx to:	Andrew Brampton (brampton@gmail.com) for his example code on how to parse HTTP streams from .pcap files using dpkg
