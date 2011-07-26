@@ -29,163 +29,233 @@
 #
 ###################################################################################################
 #
-# File:		replayproxy.py
-# Desc.:	ReplayProxy is a forensic tool to replay web-based attacks (and also general HTTP traffic) that were captured in a pcap file.
-#			Functionality:
-#			* parse HTTP streams from .pcap files
-#			* open a TCP socket and listen as a HTTP proxy using the extracted HTTP responses as a cache while refusing all requests for unknown URLs
-# Author:	Armin Buescher (armin.buescher@googlemail.com)
-# Thx to:	Andrew Brampton (brampton@gmail.com) for his example code on how to parse HTTP streams from .pcap files using dpkg
+# File:     replayproxy.py
+# Desc.:    ReplayProxy is a forensic tool to replay web-based attacks (and also general HTTP traffic) that were captured in a pcap file.
+#           Functionality:
+#           * parse HTTP streams from .pcap files
+#           * open a TCP socket and listen as a HTTP proxy using the extracted HTTP responses as a cache while refusing all requests for unknown URLs
+# Author:   Armin Buescher (armin.buescher@googlemail.com)
+# Thx to:   Andrew Brampton (brampton@gmail.com) for his example code on how to parse HTTP streams from .pcap files using dpkg
+#
+###################################################################################################
+#
+# Changelog
+# 1.1 (Marco Cova, marco@lastline.com)
+#   - tcpreassembly via pynids
+#   - initial support for non-exact matches
+#   - general refactoring
 #
 ###################################################################################################
 
 import argparse
-import sys
-import socket
-import SocketServer
-import re
 import dpkt
-
 import gzip
+import logging
+import nids
+import re
+import socket
+import sys
+import urlparse
+import SocketServer
 import StringIO
 
-def parsepcap(filename):
-	try:
-		f = open(filename, 'rb')
-		pcap = dpkt.pcap.Reader(f)
-	except:
-		print "Error: HTTPParser -> Error opening file %s" % filename
-		sys.exit(1)
+END_STATES = (nids.NIDS_CLOSE, nids.NIDS_TIMEOUT, nids.NIDS_RESET)
 
-	print "*** HTTPParser -> Loaded %s" % filename
-	
-	conn = dict()
-	requests = dict()
-	responses = dict()
-	for ts, buf in pcap:
-		eth = dpkt.ethernet.Ethernet(buf)
-		if eth.type != dpkt.ethernet.ETH_TYPE_IP:
-			continue
+# { full url: [response1] }
+# for now just assume only 1 response per url
+resources = {}
 
-		ip = eth.data
-		if ip.p != dpkt.ip.IP_PROTO_TCP:
-			continue
-		
-		tcp = ip.data
 
-		key = (ip.src, ip.dst, tcp.sport, tcp.dport)
-		if key in conn:
-			conn[key] = conn[key] + tcp.data
-		else:
-			conn[key] = tcp.data
+########################
+# pcap parsing
+########################
 
-		try:
-			stream = conn[key]
-			http = ''
-			httpkey = key
+# keep track of non-closed TCP streams, which otherwise are not processed
+# using the regular pynids API
+openstreams = {}
 
-			if stream[:4] == 'HTTP':
-				http = dpkt.http.Response(stream)
-				httpkey = (ip.dst, ip.src, tcp.dport, tcp.sport)
-				if httpkey in responses:
-					responses[httpkey].append(http)
-				else:
-					responses[httpkey] = [http]
-			else:
-				http = dpkt.http.Request(stream)
-				if httpkey in requests:
-					requests[httpkey].append(http)
-				else:
-					requests[httpkey] = [http]
+def reassembleTcpStream(tcp):
 
-			#print "*" * 80
-			#print "%s:%d -> %s:%d" % (socket.inet_ntoa(ip.src), tcp.sport, socket.inet_ntoa(ip.dst), tcp.dport)
-			#print http.headers
-			
-			stream = stream[len(http):]
-			if len(stream) == 0:
-				del conn[key]
-			else:
-				conn[key] = stream
+    if tcp.nids_state == nids.NIDS_JUST_EST:
+        # always assume it is HTTP traffic (else: if dport === 80)
+        tcp.client.collect = 1
+        tcp.server.collect = 1
 
-		except (dpkt.UnpackError):
-			pass
-		except:
-			print "Error: HTTPParser -> Unexpected error"
-	
-	files = dict()
-	for k,v1 in responses.iteritems():
-		for i,v2 in enumerate(v1):
-			if k in requests and requests[k][i]:
-				host = requests[k][i].headers['host']
-				uri = requests[k][i].uri
-				ip = socket.inet_ntoa(k[1])
-				key = (host, uri, ip)
-				files[host+uri] = (requests[k][i],v2)
-				#print "HTTPParser extracted -> %s" % host+uri
-	print "*** HTTPParser: # Files extracted -> %d" % len(files)
-	return files
+        openstreams[tcp.addr] = tcp
+    elif tcp.nids_state == nids.NIDS_DATA:
+        # keep all of the stream's new data
+        tcp.discard(0)
 
-def recvRequest(sock):
-	total_data = data = sock.recv(16384)
-	while 1:
-		try:
-			http_req = dpkt.http.Request(total_data)	
-			return http_req
-		except dpkt.NeedData:
-			data = sock.recv(16384)
-			total_data += data
-			pass
-		except:
-			"Error while processing HTTP Request!"
-			return None
+        openstreams[tcp.addr] = tcp 
+    elif tcp.nids_state in END_STATES:
+        del openstreams[tcp.addr]
 
-def sendResponse(resp,conn):
-	resp.version = '1.0'
-	if 'content-encoding' in resp.headers and resp.headers['content-encoding'] == 'gzip':
-		del resp.headers['content-encoding']
-		compressed = resp.body
-		compressedstream = StringIO.StringIO(compressed)
-		gzipper = gzip.GzipFile(fileobj=compressedstream)
-		data = gzipper.read()
-		resp.body = data
-	resp.headers['content-length'] = len(resp.body)
-	conn.send(resp.pack())
+        processTcpStream(tcp)
+    else:
+        print >>sys.stderr, "Unknown nids state"
 
-class myRequestHandler(SocketServer.BaseRequestHandler):
+def processTcpStream(tcp):
+        ((src, sport), (dst, dport)) = tcp.addr
 
-	def handle(self):
-	# handles a request of a client
-	# callback for SocketServer
-		sock_client = self.request
-		http_req = recvRequest(sock_client)
-		if http_req:
-			print "Request for URL %s" % http_req.uri
-			url = re.sub(r"^http:\/\/","",http_req.uri)
-			if url in files:
-				resp = files[url][1]
-				print "Info: ReplayProxy -> Sending %s" % url
-				sendResponse(resp,sock_client)
-				print "Page served %s " % url
-			else:
-				sock_client.send('')
-				print "Warn: URL not in cache -> %s" % url
-		sock_client.close()
+        # data to server
+        server_data= tcp.server.data[:tcp.server.count]
+        # data to client
+        client_data = tcp.client.data[:tcp.client.count]
+    
+        # extract *all* the requests in this stream
+        req = ""
+        while len(req) < len(server_data):
+            req = dpkt.http.Request(server_data)
+            host_hdr = req.headers['host']
+            full_uri = req.uri if req.uri.startswith("http://") else \
+                "http://%s:%d%s" % (host_hdr, dport, req.uri) if dport != 80 else \
+                "http://%s%s" % (host_hdr, req.uri)
+            logging.info(full_uri)
 
-### Main
-argparser = argparse.ArgumentParser()
-argparser.add_argument('-p', help='Port to listen on (DEFAULT: 3128)')
-argparser.add_argument('filename', help='Path to the .pcap file to parse')
-args = argparser.parse_args()
-if args.p == None:
-	args.p = 3128
-else:
-	try:
-		args.p = int(args.p)
-	except:
-		args.p = 3128
-HOST, PORT = "localhost", args.p
+            res = dpkt.http.Response(client_data)
+            logging.debug(res)
+            if res.headers.has_key("content-length"):
+                body_len = int(res.headers["content-length"])
+                hdr_len = client_data.find('\r\n\r\n')
+                client_data = client_data[body_len + hdr_len + 4:]
+            else:
+                hdr_body_len = client_data.find("HTTP/1")
+                client_data = client_data[hdr_body_len]
 
-files = parsepcap(args.filename)
-server = SocketServer.TCPServer( (HOST,PORT), myRequestHandler)
-server.serve_forever()
+            if not resources.has_key(full_uri):
+                resources[full_uri] = []
+            resources[full_uri].append(res)
+
+            server_data = server_data[len(req):]
+
+def get_resource(uri):
+    # exact match?
+    if resources.has_key(uri):
+        return resources[uri][0]
+
+    resources_by_domain = {}
+    for u in resources.keys():
+        domain = urlparse.urlparse(u).hostname
+        if not resources_by_domain.has_key(domain):
+            resources_by_domain[domain] = []
+        resources_by_domain[domain].append(u)
+
+    uri_domain = urlparse.urlparse(uri).hostname
+    uri_path = urlparse.urlparse(uri).path
+    if resources_by_domain.has_key(uri_domain):
+        # do we have one page from the same domain of the requested uri?
+        if len(resources_by_domain[uri_domain]) == 1:
+            logging.info("Matching %s with %s (one url from requested domain)", uri, resources_by_domain[uri_domain][0])
+            return resources[resources_by_domain[uri_domain][0]][0]
+
+        # is there a page with same path as requested uri?
+        for u in resources_by_domain[uri_domain]:
+            if urlparse.urlparse(u).path == uri_path:
+                logging.info("Matching %s with %s (same path and domain)", uri, u)
+                return resources[u][0]
+
+    return None
+
+
+########################
+# HTTP proxy
+########################
+
+class ProxyServer(SocketServer.TCPServer):
+    allow_reuse_address = True
+
+class ProxyRequestHandler(SocketServer.BaseRequestHandler):
+
+    def handle(self):
+    # handles a request of a client
+    # callback for SocketServer
+        sock_client = self.request
+        http_req = ProxyRequestHandler.recvRequest(sock_client)
+        if http_req:
+            resp = get_resource(http_req.uri)
+            if resp:
+                logging.info("Request for %s" % http_req.uri)
+                ProxyRequestHandler.sendResponse(resp, sock_client)
+            else:
+                sock_client.send('')
+                logging.warning("Request for unknown URL %s" % http_req.uri)
+        sock_client.close()
+
+    @staticmethod
+    def recvRequest(sock):
+        total_data = data = sock.recv(16384)
+        while 1:
+            try:
+                http_req = dpkt.http.Request(total_data)    
+                return http_req
+            except dpkt.NeedData:
+                data = sock.recv(16384)
+                total_data += data
+                pass
+            except:
+                "Error while processing HTTP Request!"
+                return None
+
+
+    @staticmethod
+    def sendResponse(resp, conn):
+        resp.version = '1.0'
+        if 'content-encoding' in resp.headers and resp.headers['content-encoding'] == 'gzip':
+            del resp.headers['content-encoding']
+            compressed = resp.body
+            compressedstream = StringIO.StringIO(compressed)
+            gzipper = gzip.GzipFile(fileobj=compressedstream)
+            data = gzipper.read()
+            resp.body = data
+        resp.headers['content-length'] = len(resp.body)
+        conn.send(resp.pack())
+
+
+########################
+# main
+########################
+
+def main():
+
+    # parse args
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument('PCAP', help='Path to the .pcap file to parse')
+    argparser.add_argument('-H', metavar='HOST', default='127.0.0.1', help='Address to listen on (DEFAULT: 127.0.0.1)')
+    argparser.add_argument('-p', metavar='PORT', type=int, default=3128, help='Port to listen on (DEFAULT: 3128)')
+    argparser.add_argument('-v', action='append_const', const=1, default=[], help='Increase the verbosity level')
+    args = argparser.parse_args()
+
+    HOST, PORT = args.H, args.p
+    verbosity = len(args.v)
+
+    # setup logger
+    if verbosity == 0:
+        log_level = logging.ERROR
+    elif verbosity == 1:
+        log_level = logging.INFO
+    else:
+        log_level = logging.DEBUG
+    logging.basicConfig(format='%(levelname)s:%(message)s', level=log_level)
+
+    # setup the reassembler            
+    nids.param("scan_num_hosts", 0) # disable portscan detection
+    nids.chksum_ctl([('0.0.0.0/0', False)]) # disable checksum verification: jsunpack says it may cause missed traffic
+    nids.param("filename", args.PCAP)
+    nids.init()
+    nids.register_tcp(reassembleTcpStream)
+    nids.run()
+    # process the open streams, which are not processed by pynids
+    for c, stream in openstreams.items():
+        processTcpStream(stream)
+    
+    # run proxy server
+    server = ProxyServer( (HOST,PORT), ProxyRequestHandler)
+    server.allow_reuse_address = True
+    try:
+	logging.info("Proxy listening on %s:%d" % (HOST,PORT))
+        server.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
