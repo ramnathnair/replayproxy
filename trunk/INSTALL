@@ -1,13 +1,3 @@
-= Usage =
-replayproxy _filename.pcap_
-
-= Functionality =
-ReplayProxy
-	* parses HTTP streams from .pcap files
-	* opens a TCP socket on port 3128 and listens as a HTTP proxy using the extracted HTTP responses as a cache while refusing all requests for unknown URLs
-
 = Dependencies =
+	* pynids library (http://jon.oberheide.org/pynids/)
 	* dpkt library (http://code.google.com/p/dpkt/)
-
-= Tips/Tricks =
-	* to capture .pcap files you can e.g. use tcpdump integrated in most linux distributions or Wireshark
